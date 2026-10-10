@@ -526,7 +526,20 @@ ULONGLONG CAsyncFileReader::GetLength()
 
 STDMETHODIMP CAsyncFileReader::SyncRead(LONGLONG llPosition, LONG lLength, BYTE* pBuffer)
 {
+	{
+		static volatile LONG s_in_cnt = 0;
+		const LONG c = InterlockedIncrement(&s_in_cnt);
+		if (c <= 24 || (c % 8192) == 0) {
+			lz01_dbg(L"[sync] #%ld pos=%I64d len=%d logical=%I64u encLen=%I64u",
+			         c, (__int64)llPosition, (int)lLength,
+			         (unsigned long long)GetLength(),
+			         (unsigned long long)m_lz01_encLen);
+		}
+	}
+
 	if ((ULONGLONG)llPosition + lLength > GetLength()) {
+		lz01_dbg(L"[sync] *** GUARD REJECT pos=%I64d len=%d logical=%I64u",
+		         (__int64)llPosition, (int)lLength, (unsigned long long)GetLength());
 		return E_FAIL;
 	}
 
@@ -599,12 +612,17 @@ STDMETHODIMP CAsyncFileReader::SyncRead(LONGLONG llPosition, LONG lLength, BYTE*
 		if (m_lz01_encLen != 0) {
 			static volatile LONG s_dbg_cnt = 0;
 			const LONG cnt = InterlockedIncrement(&s_dbg_cnt);
-			if (cnt <= 6 || (cnt % 4096) == 0) {
-				lz01_dbg(L"[read] #%ld off=%I64u len=%u encLen=%I64u",
+			if (cnt <= 6) {
+				lz01_dbg(L"[read] #%ld off=%I64u len=%u encLen=%I64u  BEFORE=%02x%02x%02x%02x",
 				         cnt, (unsigned long long)llPosition, (unsigned)lLength,
-				         (unsigned long long)m_lz01_encLen);
+				         (unsigned long long)m_lz01_encLen,
+				         pBuffer[0], pBuffer[1], pBuffer[2], pBuffer[3]);
 			}
 			lz01_decrypt_inplace(pBuffer, (size_t)lLength, (uint64_t)llPosition, m_lz01_encLen);
+			if (cnt <= 6) {
+				lz01_dbg(L"[read] #%ld AFTER =%02x%02x%02x%02x  (明文头应为 00000020 66747970)",
+				         cnt, pBuffer[0], pBuffer[1], pBuffer[2], pBuffer[3]);
+			}
 		}
 		/* ---------- 补丁结束 ---------- */
 

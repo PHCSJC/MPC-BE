@@ -22,9 +22,72 @@
 #include "stdafx.h"
 #include "BaseSplitterFile.h"
 
+#include <cstdarg>
+
 //
 // CBaseSplitterFile
 //
+
+
+/* ===== 调试日志（仅 LZ01 排障用，exe 同目录有 LZ01_debug.on 才写）===== */
+static void lz01_dbg_bsf(const wchar_t* fmt, ...)
+{
+	static bool init = false;
+	static bool on = false;
+	static wchar_t logpath[MAX_PATH] = {};
+
+	if (!init) {
+		init = true;
+		wchar_t dir[MAX_PATH] = {};
+		if (GetModuleFileNameW(nullptr, dir, MAX_PATH) != 0) {
+			wchar_t* slash = wcsrchr(dir, L'\\');
+			if (slash) {
+				*(slash + 1) = 0;
+			}
+			wchar_t onpath[MAX_PATH] = {};
+			int k = 0;
+			for (; dir[k] && k < MAX_PATH - 20; k++) { onpath[k] = dir[k]; }
+			const wchar_t* a = L"LZ01_debug.on";
+			for (int j = 0; a[j] && k < MAX_PATH - 1; j++, k++) { onpath[k] = a[j]; }
+			onpath[k] = 0;
+			on = (GetFileAttributesW(onpath) != INVALID_FILE_ATTRIBUTES);
+
+			k = 0;
+			for (; dir[k] && k < MAX_PATH - 20; k++) { logpath[k] = dir[k]; }
+			const wchar_t* b = L"LZ01_debug.log";
+			for (int j = 0; b[j] && k < MAX_PATH - 1; j++, k++) { logpath[k] = b[j]; }
+			logpath[k] = 0;
+		}
+	}
+	if (!on) {
+		return;
+	}
+
+	wchar_t buf[1024];
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vswprintf(buf, 1024, fmt, ap);
+	va_end(ap);
+	if (n <= 0) {
+		return;
+	}
+	if (n > 1022) {
+		n = 1022;
+	}
+	buf[n] = L'\n';
+	buf[n + 1] = 0;
+
+	HANDLE h = CreateFileW(logpath, FILE_APPEND_DATA,
+	                       FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+	                       OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (h == INVALID_HANDLE_VALUE) {
+		return;
+	}
+	DWORD wr = 0;
+	WriteFile(h, buf, (DWORD)((n + 1) * sizeof(wchar_t)), &wr, nullptr);
+	CloseHandle(h);
+}
+/* ===== 调试日志结束 ===== */
 
 CBaseSplitterFile::CBaseSplitterFile(IAsyncReader* pAsyncReader, HRESULT& hr, int fmode)
 	: m_pAsyncReader(pAsyncReader)
@@ -80,6 +143,8 @@ CBaseSplitterFile::CBaseSplitterFile(IAsyncReader* pAsyncReader, HRESULT& hr, in
 		m_ThreadLength = std::thread([this] { ThreadUpdateLength(); });
 		::SetThreadPriority(m_ThreadLength.native_handle(), THREAD_PRIORITY_LOWEST);
 	}
+
+	lz01_dbg_bsf(L"[bsf] ctor fmode=%d m_len=%I64u m_available=%I64u cachetotal=%d", (int)m_fmode, m_len, m_available, m_cachetotal);
 
 	m_pSyncReader = m_pAsyncReader;
 
@@ -253,11 +318,21 @@ HRESULT CBaseSplitterFile::Read(BYTE* pData, int len)
 {
 	CheckPointer(m_pAsyncReader, E_NOINTERFACE);
 
+	{
+		static volatile LONG s_c = 0;
+		const LONG c = InterlockedIncrement(&s_c);
+		if (c <= 24 || (c % 512) == 0) {
+			lz01_dbg_bsf(L"[bsf] Read #%ld pos=%I64d len=%d m_len=%I64u m_available=%I64u", c, (__int64)m_pos, len, m_len, m_available);
+		}
+	}
+
 	__int64 new_pos = m_pos + len;
 	if (!IsStreaming() && (new_pos > m_len || m_bConnectionLost)) {
+		lz01_dbg_bsf(L"[bsf] Read E_FAIL(new_pos>m_len) pos=%I64d len=%d new_pos=%I64d m_len=%I64u lost=%d", (__int64)m_pos, len, new_pos, m_len, (int)m_bConnectionLost);
 		Exit(E_FAIL);
 	}
 	if (m_fmode == FM_FILE_DL && new_pos > m_available && !WaitData(new_pos)) {
+		lz01_dbg_bsf(L"[bsf] Read E_FAIL(wait) pos=%I64d len=%d m_available=%I64u", (__int64)m_pos, len, m_available);
 		Exit(E_FAIL);
 	}
 
@@ -309,6 +384,7 @@ HRESULT CBaseSplitterFile::Read(BYTE* pData, int len)
 		int maxlen = (int)std::min<__int64>(tmplen, m_cachetotal);
 		int minlen = std::min(len, maxlen);
 		if (minlen <= 0) {
+			lz01_dbg_bsf(L"[bsf] Read S_FALSE pos=%I64d len=%d maxlen=%d m_available=%I64u", (__int64)m_pos, len, maxlen, m_available);
 			Exit(S_FALSE);
 		}
 
