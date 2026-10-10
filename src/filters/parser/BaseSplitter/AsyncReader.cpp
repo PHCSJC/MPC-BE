@@ -412,6 +412,83 @@ static void lz01_decrypt_inplace(void* buf, size_t len, uint64_t off, uint64_t e
 
 /* ================== LZ01 end ================== */
 
+/*
+ * 用文件句柄直接探测末尾 16 字节标记（不依赖 CMultiFiles 的 Seek/Read）。
+ * 之所以不放在 Open() 里：MPC-BE 打开本地文件有两条构造路径 ——
+ *   CAsyncFileReader(pszFileName, hr, ...)   → Open()
+ *   CAsyncFileReader(m_Items, hr)            → OpenFiles()   ← 实际播放常常走这条
+ * 放在这里（由 GetLength() 懒触发）可以两条都覆盖，且只跑一次。
+ */
+void CAsyncFileReader::LZ01_Probe()
+{
+	if (m_lz01Checked) {
+		return;
+	}
+	m_lz01Checked = true;
+	m_lz01_encLen = 0;
+
+	lz01_dbg(L"[probe] enter: sourcetype=%d url=%d hFile=%d parts=%zu",
+	         (int)m_sourcetype, (int)(m_url.IsEmpty() ? 0 : 1),
+	         (int)(m_hFile != INVALID_HANDLE_VALUE),
+	         (size_t)m_strFiles.size());
+
+	/* 只处理本地单文件；网络源与蓝光多文件播放列表不处理 */
+	if (m_sourcetype != SourceType::LOCAL || !m_url.IsEmpty()
+			|| m_hFile == INVALID_HANDLE_VALUE || m_strFiles.size() != 1) {
+		return;
+	}
+
+	LARGE_INTEGER sz = {};
+	if (!GetFileSizeEx(m_hFile, &sz) || sz.QuadPart <= LZ01_TRAILER_SIZE) {
+		return;
+	}
+	m_lz01_phys = (ULONGLONG)sz.QuadPart;
+
+	lz01_load_cfg();
+
+	/* 记住当前位置，探测完恢复 */
+	LARGE_INTEGER zero = {}, saved = {};
+	SetFilePointerEx(m_hFile, zero, &saved, FILE_CURRENT);
+
+	const ULONGLONG end = m_lz01_phys - LZ01_TRAILER_SIZE;
+	uint8_t tail[LZ01_TRAILER_SIZE] = {};
+
+	LARGE_INTEGER off = {};
+	off.QuadPart = (LONGLONG)end;
+	BOOL okSeek = SetFilePointerEx(m_hFile, off, nullptr, FILE_BEGIN);
+	DWORD rd = 0;
+	BOOL okRead = okSeek ? ReadFile(m_hFile, tail, LZ01_TRAILER_SIZE, &rd, nullptr) : FALSE;
+
+	SetFilePointerEx(m_hFile, saved, nullptr, FILE_BEGIN);
+
+	lz01_dbg(L"[probe] phys=%I64u end=%I64u seek=%d read=%u tail=%02x%02x%02x%02x",
+	         m_lz01_phys, end, (int)okSeek, rd, tail[0], tail[1], tail[2], tail[3]);
+
+	if (okRead && rd == LZ01_TRAILER_SIZE && memcmp(tail, LZ01_MAGIC, 4) == 0) {
+		const uint32_t version = lz01_get_be32(tail + 4);
+		const uint64_t encLen  = lz01_get_be64(tail + 8);
+
+		lz01_dbg(L"[probe] LZ01 marker: ver=%u N=%I64u (limit=%I64u)", version, encLen, end);
+
+		if (version == 1 && encLen > 0 && encLen <= end) {
+			m_lz01_encLen = encLen;
+			m_total       = end;        // 对外长度 = 物理长度 - 16
+			lz01_dbg(L"[probe] ACCEPTED encLen=%I64u logical=%I64u", encLen, end);
+			DLog(L"CAsyncFileReader : LZ01 container, encrypt header %I64u bytes, logical size %I64u", encLen, end);
+		} else {
+			lz01_dbg(L"[probe] REJECTED ver/N out of range");
+		}
+	}
+
+	/* force=1 时，对「没有标记」的文件也按加密处理（例如尾部标记被裁掉的变体） */
+	if (m_lz01_encLen == 0 && g_lz01_force && g_lz01_forceN > 0) {
+		const uint64_t logical = (uint64_t)m_lz01_phys;
+		m_lz01_encLen = (g_lz01_forceN <= logical) ? g_lz01_forceN : logical;
+		m_total       = logical;
+		lz01_dbg(L"[probe] FORCE mode, encLen=%I64u", m_lz01_encLen);
+	}
+}
+
 //
 // CAsyncFileReader
 //
@@ -467,51 +544,8 @@ BOOL CAsyncFileReader::Open(LPCWSTR lpszFileName)
 	}
 
 	/* ---------- 本地补丁：LZ01 探测 ---------- */
-	m_lz01_encLen = 0;
-	m_lz01_phys   = __super::GetLength();
-
-	lz01_dbg(L"[open] local branch, phys=%I64u", m_lz01_phys);
-	lz01_load_cfg();
-
-	if (m_lz01_phys > LZ01_TRAILER_SIZE) {
-		const ULONGLONG end = m_lz01_phys - LZ01_TRAILER_SIZE;
-
-		uint8_t tail[LZ01_TRAILER_SIZE] = {};
-		const ULONGLONG seekres = Seek((LONGLONG)end, FILE_BEGIN);
-
-		DWORD dwError = ERROR_SUCCESS;
-		UINT rd = (seekres == end) ? Read(tail, LZ01_TRAILER_SIZE, dwError) : 0;
-
-		lz01_dbg(L"[probe] end=%I64u seek=%I64u read=%u err=%u tail=%02x%02x%02x%02x",
-		         end, seekres, rd, dwError, tail[0], tail[1], tail[2], tail[3]);
-
-		if (seekres == end && rd == LZ01_TRAILER_SIZE && memcmp(tail, LZ01_MAGIC, 4) == 0) {
-			const uint32_t version = lz01_get_be32(tail + 4);
-			const uint64_t encLen  = lz01_get_be64(tail + 8);
-
-			lz01_dbg(L"[probe] LZ01 marker: ver=%u N=%I64u (limit=%I64u)", version, encLen, end);
-
-			if (version == 1 && encLen > 0 && encLen <= end) {
-				m_lz01_encLen = encLen;
-				m_total       = end;        // 对外长度 = 物理长度 - 16
-				lz01_dbg(L"[probe] ACCEPTED encLen=%I64u logical=%I64u", encLen, end);
-				DLog(L"CAsyncFileReader::Open() : LZ01 container, encrypt header %I64u bytes, logical size %I64u", encLen, end);
-			} else {
-				lz01_dbg(L"[probe] REJECTED ver/N out of range");
-				DLog(L"CAsyncFileReader::Open() : LZ01 marker found but version/N invalid (v=%u N=%I64u) - ignored", version, encLen);
-			}
-		}
-		Seek(0, FILE_BEGIN);
-	}
-
-	/* force=1 时，对「没有标记」的文件也按加密处理（例如尾部标记被裁掉的变体） */
-	if (m_lz01_encLen == 0 && g_lz01_force && g_lz01_forceN > 0) {
-		const uint64_t logical = (uint64_t)m_lz01_phys;
-		m_lz01_encLen = (g_lz01_forceN <= logical) ? g_lz01_forceN : logical;
-		m_total       = logical;
-		lz01_dbg(L"[probe] FORCE mode, encLen=%I64u", m_lz01_encLen);
-		DLog(L"CAsyncFileReader::Open() : LZ01 forced mode, encrypt header %I64u bytes", m_lz01_encLen);
-	}
+	lz01_dbg(L"[open] local branch, open ok");
+	LZ01_Probe();
 	/* ---------- 补丁结束 ---------- */
 
 	return TRUE;
@@ -519,6 +553,7 @@ BOOL CAsyncFileReader::Open(LPCWSTR lpszFileName)
 
 ULONGLONG CAsyncFileReader::GetLength()
 {
+	LZ01_Probe();   // 懒探测：单文件构造与播放列表构造两条路径都会经过这里
 	return m_total ? m_total : __super::GetLength();
 }
 

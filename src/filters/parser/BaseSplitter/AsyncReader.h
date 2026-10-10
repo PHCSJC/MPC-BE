@@ -71,11 +71,15 @@ protected:
 	// LZ01 加密容器（本地补丁新增）
 	//   m_lz01_encLen : 被加密的头部字节数；0 表示该文件未加密
 	//   m_lz01_phys   : 物理文件大小（含末尾 16 字节标记）
+	//   m_lz01Checked : 是否已探测过（懒加载，两条构造函数路径都会用到）
 	// 命中标记时 m_total 会被改成「物理大小 - 16」，因此 GetLength()
 	// 返回的就是逻辑长度，SyncRead()/Length() 无需再改。
 	// ---------------------------------------------------------------
 	ULONGLONG m_lz01_encLen = 0;
 	ULONGLONG m_lz01_phys = 0;
+	bool m_lz01Checked = false;
+
+	void LZ01_Probe();   // 直接用 m_hFile 探测末尾标记；可重复调用（内部只跑一次）
 
 	virtual BOOL Open(LPCWSTR lpszFileName) final;
 	virtual ULONGLONG GetLength() final;
