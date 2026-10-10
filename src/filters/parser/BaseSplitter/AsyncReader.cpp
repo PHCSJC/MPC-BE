@@ -47,6 +47,7 @@
 #include "DSUtil/Log.h"
 
 #include <cstdint>
+#include <cstdarg>
 #include <cstring>
 
 /* ================= LZ01 begin ================= */
@@ -232,6 +233,73 @@ static int lz01_hex2bin(const char* hex, uint8_t* out, size_t outlen)
 	return 0;
 }
 
+/* 拼接 <dir><name> */
+static void lz01_mkpath(const wchar_t* dir, const wchar_t* name, wchar_t* out, size_t cch)
+{
+	size_t k = 0;
+	for (; dir[k] && k + 1 < cch; k++) {
+		out[k] = dir[k];
+	}
+	for (size_t j = 0; name[j] && k + 1 < cch; j++) {
+		out[k++] = name[j];
+	}
+	out[k] = 0;
+}
+
+/*
+ * 可选调试日志：只有 exe 同目录存在 LZ01_debug.on 时才写 LZ01_debug.log。
+ * 平时（没有那个标记文件）这个函数在第一行就返回，零开销。
+ */
+static void lz01_dbg(const wchar_t* fmt, ...)
+{
+	static bool init = false;
+	static bool on = false;
+	static wchar_t logpath[MAX_PATH] = {};
+
+	if (!init) {
+		init = true;
+		wchar_t dir[MAX_PATH] = {};
+		if (GetModuleFileNameW(nullptr, dir, MAX_PATH) != 0) {
+			wchar_t* slash = wcsrchr(dir, L'\\');
+			if (slash) {
+				*(slash + 1) = 0;
+			}
+			wchar_t onpath[MAX_PATH] = {};
+			lz01_mkpath(dir, L"LZ01_debug.on", onpath, MAX_PATH);
+			on = (GetFileAttributesW(onpath) != INVALID_FILE_ATTRIBUTES);
+			lz01_mkpath(dir, L"LZ01_debug.log", logpath, MAX_PATH);
+		}
+	}
+
+	if (!on) {
+		return;
+	}
+
+	wchar_t buf[1024];
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vswprintf(buf, 1024, fmt, ap);
+	va_end(ap);
+	if (n <= 0) {
+		return;
+	}
+	if (n > 1022) {
+		n = 1022;
+	}
+	buf[n] = L'\n';
+	buf[n + 1] = 0;
+
+	HANDLE h = CreateFileW(logpath, FILE_APPEND_DATA,
+	                       FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+	                       OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+	if (h == INVALID_HANDLE_VALUE) {
+		return;
+	}
+	DWORD wr = 0;
+	WriteFile(h, buf, (DWORD)((n + 1) * sizeof(wchar_t)), &wr, nullptr);
+	CloseHandle(h);
+}
+
 /* 读 exe 同目录的 LZ01.ini（不存在则一律用编译期默认值） */
 static void lz01_load_cfg(void)
 {
@@ -296,6 +364,15 @@ static void lz01_load_cfg(void)
 
 	lz01_aes256_init(&g_lz01_aes, key);
 	g_lz01_aesReady = true;
+
+	{
+		uint8_t ks[16];
+		lz01_keystream(&g_lz01_aes, g_lz01_nonce, 0, ks);
+		lz01_dbg(L"[cfg] ready=%d force=%d n=%I64u nonce0=%02x%02x%02x%02x ks0=%02x%02x%02x%02x",
+		         (int)g_lz01_aesReady, (int)g_lz01_force, g_lz01_forceN,
+		         g_lz01_nonce[0], g_lz01_nonce[1], g_lz01_nonce[2], g_lz01_nonce[3],
+		         ks[0], ks[1], ks[2], ks[3]);
+	}
 }
 
 /* 就地解密 buf 中落在 [0, encLen) 内的部分；off 为该缓冲区在文件中的绝对偏移 */
@@ -393,26 +470,35 @@ BOOL CAsyncFileReader::Open(LPCWSTR lpszFileName)
 	m_lz01_encLen = 0;
 	m_lz01_phys   = __super::GetLength();
 
+	lz01_dbg(L"[open] local branch, phys=%I64u", m_lz01_phys);
 	lz01_load_cfg();
 
 	if (m_lz01_phys > LZ01_TRAILER_SIZE) {
 		const ULONGLONG end = m_lz01_phys - LZ01_TRAILER_SIZE;
 
 		uint8_t tail[LZ01_TRAILER_SIZE] = {};
-		if (Seek((LONGLONG)end, FILE_BEGIN) == end) {
-			DWORD dwError = ERROR_SUCCESS;
-			if (Read(tail, LZ01_TRAILER_SIZE, dwError) == LZ01_TRAILER_SIZE
-					&& memcmp(tail, LZ01_MAGIC, 4) == 0) {
-				const uint32_t version = lz01_get_be32(tail + 4);
-				const uint64_t encLen  = lz01_get_be64(tail + 8);
+		const ULONGLONG seekres = Seek((LONGLONG)end, FILE_BEGIN);
 
-				if (version == 1 && encLen > 0 && encLen <= end) {
-					m_lz01_encLen = encLen;
-					m_total       = end;        // 对外长度 = 物理长度 - 16
-					DLog(L"CAsyncFileReader::Open() : LZ01 container, encrypt header %I64u bytes, logical size %I64u", encLen, end);
-				} else {
-					DLog(L"CAsyncFileReader::Open() : LZ01 marker found but version/N invalid (v=%u N=%I64u) - ignored", version, encLen);
-				}
+		DWORD dwError = ERROR_SUCCESS;
+		UINT rd = (seekres == end) ? Read(tail, LZ01_TRAILER_SIZE, dwError) : 0;
+
+		lz01_dbg(L"[probe] end=%I64u seek=%I64u read=%u err=%u tail=%02x%02x%02x%02x",
+		         end, seekres, rd, dwError, tail[0], tail[1], tail[2], tail[3]);
+
+		if (seekres == end && rd == LZ01_TRAILER_SIZE && memcmp(tail, LZ01_MAGIC, 4) == 0) {
+			const uint32_t version = lz01_get_be32(tail + 4);
+			const uint64_t encLen  = lz01_get_be64(tail + 8);
+
+			lz01_dbg(L"[probe] LZ01 marker: ver=%u N=%I64u (limit=%I64u)", version, encLen, end);
+
+			if (version == 1 && encLen > 0 && encLen <= end) {
+				m_lz01_encLen = encLen;
+				m_total       = end;        // 对外长度 = 物理长度 - 16
+				lz01_dbg(L"[probe] ACCEPTED encLen=%I64u logical=%I64u", encLen, end);
+				DLog(L"CAsyncFileReader::Open() : LZ01 container, encrypt header %I64u bytes, logical size %I64u", encLen, end);
+			} else {
+				lz01_dbg(L"[probe] REJECTED ver/N out of range");
+				DLog(L"CAsyncFileReader::Open() : LZ01 marker found but version/N invalid (v=%u N=%I64u) - ignored", version, encLen);
 			}
 		}
 		Seek(0, FILE_BEGIN);
@@ -423,6 +509,7 @@ BOOL CAsyncFileReader::Open(LPCWSTR lpszFileName)
 		const uint64_t logical = (uint64_t)m_lz01_phys;
 		m_lz01_encLen = (g_lz01_forceN <= logical) ? g_lz01_forceN : logical;
 		m_total       = logical;
+		lz01_dbg(L"[probe] FORCE mode, encLen=%I64u", m_lz01_encLen);
 		DLog(L"CAsyncFileReader::Open() : LZ01 forced mode, encrypt header %I64u bytes", m_lz01_encLen);
 	}
 	/* ---------- 补丁结束 ---------- */
@@ -510,6 +597,13 @@ STDMETHODIMP CAsyncFileReader::SyncRead(LONGLONG llPosition, LONG lLength, BYTE*
 
 		/* ---------- 本地补丁：就地解密 ---------- */
 		if (m_lz01_encLen != 0) {
+			static volatile LONG s_dbg_cnt = 0;
+			const LONG cnt = InterlockedIncrement(&s_dbg_cnt);
+			if (cnt <= 6 || (cnt % 4096) == 0) {
+				lz01_dbg(L"[read] #%ld off=%I64u len=%u encLen=%I64u",
+				         cnt, (unsigned long long)llPosition, (unsigned)lLength,
+				         (unsigned long long)m_lz01_encLen);
+			}
 			lz01_decrypt_inplace(pBuffer, (size_t)lLength, (uint64_t)llPosition, m_lz01_encLen);
 		}
 		/* ---------- 补丁结束 ---------- */
