@@ -17,6 +17,10 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  *
+ * ============================================================================
+ *  本地补丁：LZ01 加密容器支持
+ *  改动点（相对上游）：protected 段末尾新增 2 个成员变量，marker 见下方注释。
+ * ============================================================================
  */
 
 #pragma once
@@ -62,6 +66,16 @@ protected:
 	ULONGLONG m_total = 0;
 	LONGLONG m_pos = 0;
 	CString m_url;
+
+	// ---------------------------------------------------------------
+	// LZ01 加密容器（本地补丁新增）
+	//   m_lz01_encLen : 被加密的头部字节数；0 表示该文件未加密
+	//   m_lz01_phys   : 物理文件大小（含末尾 16 字节标记）
+	// 命中标记时 m_total 会被改成「物理大小 - 16」，因此 GetLength()
+	// 返回的就是逻辑长度，SyncRead()/Length() 无需再改。
+	// ---------------------------------------------------------------
+	ULONGLONG m_lz01_encLen = 0;
+	ULONGLONG m_lz01_phys = 0;
 
 	virtual BOOL Open(LPCWSTR lpszFileName) final;
 	virtual ULONGLONG GetLength() final;
