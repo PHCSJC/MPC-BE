@@ -356,7 +356,20 @@ static void lz01_load_cfg(void)
 		if (g_lz01_force) {
 			wchar_t nbuf[64] = {};
 			if (GetPrivateProfileStringW(L"LZ01", L"n", L"0", nbuf, 64, ini) > 0) {
-				g_lz01_forceN = wcstoull(nbuf, nullptr, 10);
+				/* 不用 wcstoull —— 它在 MinGW/ucrt 混合链接下会与
+				   libmingwex.a 的 wcstoumax.o 符号冲突（x86 LNK2005），自己解析十进制 */
+				uint64_t v = 0;
+				bool any = false;
+				for (int i = 0; nbuf[i]; i++) {
+					if (nbuf[i] < L'0' || nbuf[i] > L'9') {
+						break;
+					}
+					v = v * 10 + (uint64_t)(nbuf[i] - L'0');
+					any = true;
+				}
+				if (any) {
+					g_lz01_forceN = v;
+				}
 			}
 		}
 	}
