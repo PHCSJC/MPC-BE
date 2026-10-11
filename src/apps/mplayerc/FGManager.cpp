@@ -29,6 +29,7 @@
 #include "DSUtil/std_helper.h"
 #include "DSUtil/NullRenderers.h"
 #include "DSUtil/FileHandle.h"
+#include "DSUtil/LZ01.h"   // 本地补丁：LZ01 加密容器
 #include "filters/transform/DeCSSFilter/VobFile.h"
 #include <dmodshow.h>
 #include <evr.h>
@@ -237,6 +238,12 @@ bool CFGManager::CheckBytes(HANDLE hFile, CString chkbytes)
 	LARGE_INTEGER size = {0, 0};
 	GetFileSizeEx(hFile, &size);
 
+	/* 本地补丁：LZ01 —— 这里是「按文件签名选源过滤器」的嗅探入口，
+	   它直接读原文件、绕开了 CAsyncFileReader，所以必须在这里也解密，
+	   否则密文匹配不上 ftyp，MP4 分路器就拿不到最高优先级。 */
+	lz01_info_t lz01;
+	lz01_probe_handle(hFile, &lz01);
+
 	while (sl.size() >= 4) {
 		CString offsetstr = sl.front();
 		sl.pop_front();
@@ -274,7 +281,15 @@ bool CFGManager::CheckBytes(HANDLE hFile, CString chkbytes)
 		for (size_t i = 0; i < val.size(); i++) {
 			BYTE b;
 			DWORD r;
-			if (!ReadFile(hFile, &b, 1, &r, nullptr) || (b & mask[i]) != val[i]) {
+			LARGE_INTEGER cur = {}, nocur = {};
+			SetFilePointerEx(hFile, nocur, &cur, FILE_CURRENT);
+			if (!ReadFile(hFile, &b, 1, &r, nullptr)) {
+				return false;
+			}
+			if (lz01.active) {
+				b = lz01_decrypt_byte(b, (uint64_t)cur.QuadPart, (uint64_t)lz01.encLen);
+			}
+			if ((b & mask[i]) != val[i]) {
 				return false;
 			}
 		}
@@ -413,6 +428,10 @@ HRESULT CFGManager::EnumSourceFilters(LPCWSTR lpcwstrFileName, CFGFilterList& fl
 			for (const auto& pFGF : m_source) {
 				for (const auto& bytestring : pFGF->m_chkbytes) {
 					if (CheckBytes(hFile, bytestring)) {
+						{
+							CStringW nm(pFGF->GetName());
+							lz01_dbg(L"[sniff] SIGNATURE MATCH: %ls", nm.GetString());
+						}
 						fl.Insert(pFGF, 1, false, false);
 						break;
 					}
@@ -425,6 +444,10 @@ HRESULT CFGManager::EnumSourceFilters(LPCWSTR lpcwstrFileName, CFGFilterList& fl
 
 			for (const auto& pFGF : m_source) {
 				if (Contains(pFGF->m_extensions, ext)) {
+					{
+						CStringW nm(pFGF->GetName());
+						lz01_dbg(L"[sniff] EXT MATCH %ls (ext=%ls)", nm.GetString(), ext.GetString());
+					}
 					fl.Insert(pFGF, 2, false, false);
 				}
 			}
